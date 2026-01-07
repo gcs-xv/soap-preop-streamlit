@@ -125,6 +125,17 @@ class ParsedSoap:
     kamar: str = ""                 # untuk pre-op biasanya ada
     rm: str = ""
 
+    # New fields for BB/TB and tindakan/anestesi guess, minlap penunjang, jam operasi, etc.
+    bb: float = 0.0
+    tb: float = 0.0
+    tindakan_guess: str = ""
+    anestesi_guess: str = ""
+    minlap_penunjang_raw: str = ""   # raw block with indentation preserved
+    minlap_jam_operasi: str = ""     # e.g. 08.00
+    minlap_zona_waktu: str = ""      # e.g. WITA
+    dpjp_anestesi: str = ""          # optional
+    sirkuler: str = ""               # optional
+
     S: str = ""
     O_generalis: str = ""
     EO: str = ""
@@ -197,6 +208,18 @@ def parse_raw_soap(raw: str) -> ParsedSoap:
         # fallback: ambil dari "Status Generalis" sampai sebelum "Status Lokalis" atau EO
         p.O_generalis = normalize_bullets(pick_block(o_block, r"Status\s+Generalis\s*:\s*", r"\n\s*(Status\s+Lokalis|EO\s*:|E\.?O\s*:)\s*"))
 
+    # BB/TB from Status Generalis or O block
+    bb_txt = pick1(o_block, r"\bBB\s*:?\s*([0-9]+(?:\.[0-9]+)?)\s*kg", re.IGNORECASE)
+    tb_txt = pick1(o_block, r"\bTB\s*:?\s*([0-9]+(?:\.[0-9]+)?)\s*cm", re.IGNORECASE)
+    try:
+        p.bb = float(bb_txt) if bb_txt else 0.0
+    except Exception:
+        p.bb = 0.0
+    try:
+        p.tb = float(tb_txt) if tb_txt else 0.0
+    except Exception:
+        p.tb = 0.0
+
     # EO & IO
     p.EO = normalize_bullets(pick_block(o_block, r"\bEO\s*:\s*", r"\n\s*IO\s*:\s*")) or \
            normalize_bullets(pick_block(o_block, r"\bE\.?O\s*:\s*", r"\n\s*I\.?O\s*:\s*"))
@@ -231,6 +254,11 @@ def parse_raw_soap(raw: str) -> ParsedSoap:
     # Rapikan A (biar bullet konsisten)
     p.A = normalize_bullets(p.A)
 
+    # Guess tindakan + anestesi from P block
+    t_guess, a_guess = tindakan_from_p_block(raw)
+    p.tindakan_guess = t_guess
+    p.anestesi_guess = a_guess
+
     return p
 
 # -------------------------
@@ -262,6 +290,90 @@ def lab_block_to_items(lab_text: str) -> list[str]:
     return items
 
 # -------------------------
+# Tindakan dari P block helper
+# -------------------------
+def tindakan_from_p_block(raw: str) -> tuple[str, str]:
+    """Try to extract tindakan + anestesi from the last 'Pro ...' line in P section of raw SOAP."""
+    p_block = pick_block(raw, r"\bP\s*:\s*", r"\n\s*(Izin|Mohon|Residen|DPJP)\s*:\s*")
+    if not p_block:
+        p_block = pick_block(raw, r"\bP\s*:\s*", r"\Z")
+    p_block = normalize_bullets(p_block)
+    if not p_block:
+        return ("", "")
+
+    # find last line containing 'Pro ...'
+    lines = [ln.strip() for ln in p_block.splitlines() if ln.strip()]
+    pro_lines = [ln for ln in lines if re.search(r"\bPro\b", ln, re.IGNORECASE)]
+    if not pro_lines:
+        return ("", "")
+    last = pro_lines[-1]
+    last = re.sub(r"^•\s*", "", last)
+
+    # capture tindakan
+    m = re.search(r"\bPro\b\s*(.+?)\s*(?:dalam\s+([^\n()]+)|\(|$)", last, re.IGNORECASE)
+    if not m:
+        return ("", "")
+    tindakan = clean(m.group(1))
+    anest = clean(m.group(2)) if m.lastindex and m.lastindex >= 2 else ""
+    # cleanup common trailing text
+    tindakan = re.sub(r"\s*menunggu\s+penjadwalan\.?$", "", tindakan, flags=re.IGNORECASE).strip()
+    tindakan = re.sub(r"\s*pada\s+hari\s+.+$", "", tindakan, flags=re.IGNORECASE).strip()
+    tindakan = re.sub(r"\s*Pukul\s+.+$", "", tindakan, flags=re.IGNORECASE).strip()
+    tindakan = re.sub(r"\s*di\s+.+$", "", tindakan, flags=re.IGNORECASE).strip()
+
+    return (tindakan, anest)
+
+# -------------------------
+# Minlap parser (preserve formatting)
+# -------------------------
+def parse_minlap(minlap_text: str) -> dict:
+    """Parse key fields from Minlap; preserve penunjang formatting as-is."""
+    t = (minlap_text or "").strip("\n")
+    if not t:
+        return {}
+
+    out = {}
+
+    # BB/TB
+    bb = pick1(t, r"\bBB\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*kg", re.IGNORECASE)
+    tb = pick1(t, r"\bTB\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*cm", re.IGNORECASE)
+    try:
+        out["bb"] = float(bb) if bb else 0.0
+    except Exception:
+        out["bb"] = 0.0
+    try:
+        out["tb"] = float(tb) if tb else 0.0
+    except Exception:
+        out["tb"] = 0.0
+
+    # Penunjang raw block (keep spacing)
+    m = re.search(r"Pemeriksaan\s+penunjang\s*:\s*(.*?)(?:\n\s*A\s*:|\n\s*P\s*:|\Z)", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        block = m.group(0).strip("\n")
+        # keep exactly as written, but ensure it starts with 'Pemeriksaan penunjang'
+        out["penunjang_raw"] = block
+
+    # Tindakan + anestesi from Minlap P line
+    p_line = pick1(t, r"\bP\s*:\s*(.+)", re.IGNORECASE)
+    if p_line:
+        m2 = re.search(r"\bPro\b\s*(.+?)\s*(?:dalam\s+([^\n]+))?", p_line, re.IGNORECASE)
+        if m2:
+            out["tindakan"] = clean(m2.group(1))
+            out["anestesi"] = clean(m2.group(2))
+
+    # Jam operasi & zona from 'Pukul : *08.00 WITA*'
+    m3 = re.search(r"Pukul\s*:\s*\*?\s*(\d{1,2}[\.:]\d{2})\s*([A-Z]{3,4})\s*\*?", t, re.IGNORECASE)
+    if m3:
+        out["jam_operasi"] = m3.group(1).replace(":", ".")
+        out["zona_waktu"] = m3.group(2).upper()
+
+    # DPJP Anestesi & Sirkuler
+    out["dpjp_anestesi"] = clean(pick1(t, r"DPJP\s+Anestesi\s*:\s*(.+)", re.IGNORECASE))
+    out["sirkuler"] = clean(pick1(t, r"Sirkuler\s*:\s*(.+)", re.IGNORECASE))
+
+    return out
+
+# -------------------------
 # Output builder (Pre-Op)
 # -------------------------
 def build_preop(
@@ -276,6 +388,7 @@ def build_preop(
     jenis_perawatan: str,
     kamar: str,
     penunjang_items: list[str],
+    penunjang_raw: str,
     plan_items: list[str],
     meds_items: list[str] | None,
     residen: str,
@@ -293,9 +406,11 @@ def build_preop(
         f"{p.nama} / {p.jk} / {p.umur} / {pembiayaan} / {jenis_perawatan} / {kamar} / {p.rs} / RM {p.rm}\n\n"
     )
 
-    # Penunjang block
+    # Penunjang block: prefer raw (Minlap) to preserve indentation/spacing exactly
     pen_block = ""
-    if penunjang_items:
+    if clean(penunjang_raw):
+        pen_block = clean(penunjang_raw).rstrip() + "\n\n"
+    elif penunjang_items:
         pen_block = "Pemeriksaan penunjang :\n" + "\n".join([f"•⁠  ⁠{it}" for it in penunjang_items]) + "\n\n"
 
     # A: pastikan ada bullet kalau belum
@@ -416,13 +531,13 @@ with tab1:
         placeholder="Contoh: Assalamualaikum... (Rawat Jalan)...\nTn./Ny./An. ... / L/P / ...\nS: ...\nO: ...\nA: ...\nP: ...\nResiden: ...\nDPJP: ..."
     )
 
-    st.subheader("Opsional: paste hasil LAB (biar auto masuk penunjang)")
-    lab_text = st.text_area(
-        "Blok lab (boleh apa aja formatnya, yang penting ada KEY: VALUE)",
-        height=140,
-        placeholder="Contoh:\nLab Darah (30/12/2025)\nWBC : ...\nRBC : ...\nCT : ...\nBT : ...\nGDS : ...\nHBsAg : ...\nKesan : ..."
+    st.subheader("Opsional: paste MINLAP (paling disarankan)")
+    minlap_text = st.text_area(
+        "Paste Minlap di sini (format tetap, nanti penunjang & jam operasi ikut terisi)",
+        height=220,
+        placeholder="Contoh:\n1. Nama / ...\nPerempuan BB: 49 kg, TB: 159 cm ...\nPemeriksaan penunjang :\n- OPG ...\n- Lab Darah (...)\n  • WBC : ...\n- HBsAg : ...\n  Kesan : ...\n- Thorax ...\n  Kesan: ...\nA : ...\nP : Pro ... dalam general anestesi\nPukul : *08.00 WITA*\nDPJP Anestesi: ...\nSirkuler : ..."
     )
-    st.session_state["lab_text_cache"] = lab_text
+    st.session_state["minlap_text_cache"] = minlap_text
 
     parse_if_needed(raw)
 
@@ -459,7 +574,9 @@ with tab2:
     jenis_perawatan = st.text_input("Jenis perawatan", value="Rawat Inap")
     kamar = st.text_input("Kamar/Bed", value=parsed.kamar or "")
 
-    bb = st.number_input("BB (kg)", min_value=0.0, max_value=200.0, value=0.0, step=0.1)
+    # Default BB from SOAP; can be overridden by Minlap
+    bb_default = float(parsed.bb) if getattr(parsed, "bb", 0.0) else 0.0
+    bb = st.number_input("BB (kg)", min_value=0.0, max_value=200.0, value=bb_default, step=0.1)
 
     rm = st.text_input("RM", value=parsed.rm or "")
     rs = st.text_input("RS", value=parsed.rs or "RSGMP UNHAS")
@@ -473,13 +590,25 @@ with tab2:
     tanggal_laporan = st.date_input("Tanggal laporan", value=today)
     tanggal_operasi = st.date_input("Tanggal operasi", value=default_op)
 
+    # Defaults from Minlap if pasted
+    minlap_info = parse_minlap(st.session_state.get("minlap_text_cache", ""))
+    if minlap_info.get("bb"):
+        bb = float(minlap_info.get("bb", bb))
+    jam_default = minlap_info.get("jam_operasi") or "08.00"
+    zona_default = minlap_info.get("zona_waktu") or "WITA"
+
     c1, c2 = st.columns(2)
     with c1:
-        jam_operasi = st.text_input("Jam operasi", value="08.00")
+        jam_operasi = st.text_input("Jam operasi", value=jam_default)
     with c2:
-        zona_waktu = st.text_input("Zona waktu", value="WITA")
+        zona_waktu = st.text_input("Zona waktu", value=zona_default)
 
-    anestesi = st.text_input("Anestesi", value="general anestesi")
+    anest_default = "general anestesi"
+    if getattr(parsed, "anestesi_guess", ""):
+        anest_default = parsed.anestesi_guess
+    if minlap_info.get("anestesi"):
+        anest_default = minlap_info.get("anestesi")
+    anestesi = st.text_input("Anestesi", value=anest_default or "general anestesi")
 
     # ---- Auto times from Jam Operasi ----
     op_parsed = parse_hhmm(jam_operasi)
@@ -541,9 +670,12 @@ with tab2:
         ab_jam = st.text_input("Jam antibiotik (auto = operasi - 1 jam)", value=default_ab)
         ab_skin_test = st.checkbox("Tambahkan '(skin test terlebih dahulu)'", value=True)
 
+    tindakan_default = getattr(parsed, "tindakan_guess", "") or ""
+    if minlap_info.get("tindakan"):
+        tindakan_default = minlap_info.get("tindakan")
     tindakan_line = st.text_input(
-        "Tindakan (bebas, tanpa tanggal/jam)",
-        value=""
+        "Tindakan (otomatis dari P mentah kalau ada)",
+        value=tindakan_default
     )
 
     st.divider()
@@ -557,19 +689,26 @@ with tab2:
 
     st.divider()
 
-    st.subheader("Pemeriksaan Penunjang (bebas & fleksibel)")
+    st.subheader("Pemeriksaan Penunjang")
+    penunjang_raw_default = minlap_info.get("penunjang_raw", "")
 
+    if penunjang_raw_default:
+        st.caption("Minlap terdeteksi: penunjang akan mengikuti format Minlap (spasi & indent dipertahankan).")
+
+    penunjang_raw = st.text_area(
+        "Jika kamu paste Minlap, biarkan apa adanya. Kalau kosong, pakai mode list di bawah.",
+        value=penunjang_raw_default,
+        height=260,
+        placeholder="Paste blok 'Pemeriksaan penunjang :' dari Minlap di sini untuk menjaga format."
+    )
+
+    st.caption("Mode alternatif (list): kalau kamu tidak pakai Minlap, isi 1 baris = 1 item.")
     base_pen = list(parsed.penunjang_items or [])
-    cached_lab = clean(st.session_state.get("lab_text_cache", ""))
-    lab_items = lab_block_to_items(cached_lab) if cached_lab else []
-
-    merged_pen = dedupe_case_insensitive(base_pen + lab_items)
-
     penunjang_editor = st.text_area(
-        "1 baris = 1 item penunjang (boleh CT-Scan/OPG/Thorax/Lab/EKG/HIV, dll)",
-        value="\n".join(merged_pen),
-        height=200,
-        placeholder="Contoh:\nCT-Scan (tanggal)\nKesan: ...\nThorax X-Ray (tanggal)\nOPG X-Ray (tanggal)\nLab darah (tanggal)\nWBC : ...\nKesan : ...\nEKG (tanggal)\nKesan: ...",
+        "Penunjang (list)",
+        value="\n".join(base_pen),
+        height=160,
+        placeholder="OPG X-Ray (tanggal)\nThorax X-Ray (tanggal)\nLab darah (tanggal)"
     )
     penunjang_items = dedupe_case_insensitive([x for x in penunjang_editor.splitlines() if x.strip()])
 
@@ -645,11 +784,14 @@ with tab2:
         "anestesi": anestesi, "tindakan_line": tindakan_line,
         "S": S, "O_generalis": O_generalis, "EO": EO, "IO": IO, "A": A,
         "penunjang_items": penunjang_items,
+        "penunjang_raw": penunjang_raw,
         "plan_lines": plan_lines,
         "residen": residen_out,
         "dpjp": dpjp_final,
         "bb": bb,
         "meds_items": meds_items,
+        "dpjp_anestesi": minlap_info.get("dpjp_anestesi", ""),
+        "sirkuler": minlap_info.get("sirkuler", ""),
     }
 
     st.success("✅ Sudah siap. Lanjut ke tab 3) Output.")
@@ -699,6 +841,7 @@ with tab3:
             jenis_perawatan=edited["jenis_perawatan"],
             kamar=edited["kamar"] or "(isi kamar/bed)",
             penunjang_items=edited["penunjang_items"],
+            penunjang_raw=edited.get("penunjang_raw", ""),
             plan_items=edited["plan_lines"],
             meds_items=edited.get("meds_items"),
             residen=edited["residen"] or "-",
