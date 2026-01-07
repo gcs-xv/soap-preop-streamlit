@@ -63,6 +63,49 @@ def split_residen_text(s: str) -> str:
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return ", ".join(parts)
 
+
+# -------------------------
+# Helpers for IVFD, Puasa, Antibiotik automation
+# -------------------------
+def parse_hhmm(s: str):
+    """Accepts '08.00', '08:00', '8.00', '8:0' etc. Returns (hour, minute) or None."""
+    s = clean(s)
+    if not s:
+        return None
+    s = s.replace('.', ':')
+    m = re.match(r'^(\d{1,2}):(\d{1,2})$', s)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    if h < 0 or h > 23 or mi < 0 or mi > 59:
+        return None
+    return (h, mi)
+
+def fmt_time(h: int, mi: int) -> str:
+    return f"{h:02d}.{mi:02d}"
+
+def minus_minutes(h: int, mi: int, minutes: int):
+    total = h * 60 + mi - minutes
+    total %= (24 * 60)
+    return (total // 60, total % 60)
+
+def maintenance_ml_per_hr_421(weight_kg: float) -> float:
+    """4-2-1 rule maintenance fluid (mL/hr). For convenience only; must be verified clinically."""
+    w = max(0.0, float(weight_kg))
+    if w <= 10:
+        return 4.0 * w
+    if w <= 20:
+        return 40.0 + 2.0 * (w - 10.0)
+    return 60.0 + 1.0 * (w - 20.0)
+
+def tpm_from_ml_per_hr(ml_per_hr: float, drip_factor_gtt_per_ml: int = 20) -> int:
+    """Convert mL/hr to drops per minute (tpm) given drip factor (gtt/mL)."""
+    try:
+        return int(round((float(ml_per_hr) * int(drip_factor_gtt_per_ml)) / 60.0))
+    except Exception:
+        return 0
+
 # -------------------------
 # Models
 # -------------------------
@@ -234,6 +277,7 @@ def build_preop(
     kamar: str,
     penunjang_items: list[str],
     plan_items: list[str],
+    meds_items: list[str] | None,
     residen: str,
     dpjp: str,
 ) -> str:
@@ -269,6 +313,12 @@ def build_preop(
         f"Pukul {jam_operasi} {zona_waktu} di {p.rs}"
     )
 
+    meds_block = ""
+    if meds_items:
+        meds_lines = [clean(x) for x in meds_items if clean(x)]
+        if meds_lines:
+            meds_block = "\nMedikasi:\n" + "\n".join([f"•⁠  ⁠{x}" for x in meds_lines]) + "\n"
+
     out = (
         header
         + ident
@@ -287,6 +337,7 @@ def build_preop(
         + "P:\n"
         + P_block + "\n"
         + tindakan_final + "\n\n"
+        + meds_block
         + "Mohon instruksi selanjutnya, Dokter.\n"
         + "Terima kasih.\n\n"
         + f"Residen: {residen}\n\n"
@@ -371,6 +422,7 @@ with tab1:
         height=140,
         placeholder="Contoh:\nLab Darah (30/12/2025)\nWBC : ...\nRBC : ...\nCT : ...\nBT : ...\nGDS : ...\nHBsAg : ...\nKesan : ..."
     )
+    st.session_state["lab_text_cache"] = lab_text
 
     parse_if_needed(raw)
 
@@ -407,6 +459,8 @@ with tab2:
     jenis_perawatan = st.text_input("Jenis perawatan", value="Rawat Inap")
     kamar = st.text_input("Kamar/Bed", value=parsed.kamar or "")
 
+    bb = st.number_input("BB (kg)", min_value=0.0, max_value=200.0, value=0.0, step=0.1)
+
     rm = st.text_input("RM", value=parsed.rm or "")
     rs = st.text_input("RS", value=parsed.rs or "RSGMP UNHAS")
 
@@ -426,6 +480,67 @@ with tab2:
         zona_waktu = st.text_input("Zona waktu", value="WITA")
 
     anestesi = st.text_input("Anestesi", value="general anestesi")
+
+    # ---- Auto times from Jam Operasi ----
+    op_parsed = parse_hhmm(jam_operasi)
+    default_puasa = ""
+    default_ab = ""
+    if op_parsed:
+        ph, pm = minus_minutes(op_parsed[0], op_parsed[1], 6 * 60)
+        ah, am = minus_minutes(op_parsed[0], op_parsed[1], 60)
+        default_puasa = fmt_time(ph, pm)
+        default_ab = fmt_time(ah, am)
+
+    st.subheader("Bagian P (yang wajib & sering berubah)")
+
+    cP1, cP2, cP3 = st.columns(3)
+    with cP1:
+        include_ivfd = st.toggle("IVFD", value=True)
+    with cP2:
+        include_puasa = st.toggle("Puasa 6 jam", value=True)
+    with cP3:
+        include_ab = st.toggle("Antibiotik 1 jam", value=True)
+
+    # IVFD
+    ivfd_line = ""
+    if include_ivfd:
+        st.caption("IVFD hampir selalu ada. Kamu bisa isi manual, atau pakai saran dari BB (rule 4-2-1) untuk percepat.")
+        drip_factor = st.selectbox("Set drip", options=[20, 60], index=0, help="Makrodrips biasanya 20 gtt/mL; Mikrodrips 60 gtt/mL.")
+        suggested_tpm = 0
+        if bb and bb > 0:
+            mlhr = maintenance_ml_per_hr_421(bb)
+            suggested_tpm = tpm_from_ml_per_hr(mlhr, drip_factor)
+        cI1, cI2 = st.columns(2)
+        with cI1:
+            ivfd_cairan = st.text_input("Cairan", value="RL")
+        with cI2:
+            ivfd_tpm = st.number_input("tpm", min_value=0, max_value=200, value=int(suggested_tpm) if suggested_tpm else 0, step=1)
+
+        drip_label = "makrodrips" if drip_factor == 20 else "mikrodrips"
+        if ivfd_tpm > 0:
+            ivfd_line = f"IVFD {ivfd_cairan} {ivfd_tpm} tpm ({drip_label})"
+        else:
+            ivfd_line = f"IVFD {ivfd_cairan} (isi tpm) ({drip_label})"
+
+    # Puasa
+    puasa_mulai = ""
+    if include_puasa:
+        puasa_mulai = st.text_input("Mulai puasa (auto = operasi - 6 jam)", value=default_puasa)
+
+    # Antibiotik profilaksis
+    ab_nama = ""
+    ab_dosis = ""
+    ab_jam = ""
+    ab_skin_test = True
+    if include_ab:
+        cA1, cA2 = st.columns(2)
+        with cA1:
+            ab_nama = st.text_input("Antibiotik profilaksis", value="Ceftriaxone")
+        with cA2:
+            ab_dosis = st.text_input("Dosis", value="1 gr")
+        ab_jam = st.text_input("Jam antibiotik (auto = operasi - 1 jam)", value=default_ab)
+        ab_skin_test = st.checkbox("Tambahkan '(skin test terlebih dahulu)'", value=True)
+
     tindakan_line = st.text_input(
         "Tindakan (bebas, tanpa tanggal/jam)",
         value=""
@@ -443,32 +558,18 @@ with tab2:
     st.divider()
 
     st.subheader("Pemeriksaan Penunjang (bebas & fleksibel)")
-    # Merge: parsed penunjang + lab items (kalau user isi lab_text di tab1)
-    lab_text = st.session_state.get("lab_text_cache", "")
-    # cache lab from tab1 to tab2/tab3
-    # (kalau belum ada, ambil dari widget tab1 via session_state kalau tersedia)
-    if "lab_text_cache" not in st.session_state:
-        st.session_state["lab_text_cache"] = ""
-
-    # try to read latest lab text from tab1 if user already typed there
-    # (Streamlit state untuk widget beda tab bisa tricky; simplest: user paste lagi di tab1 bila perlu)
-    # We'll still allow manual penunjang edit below.
 
     base_pen = list(parsed.penunjang_items or [])
-    # If user pasted lab_text in tab1, we can re-derive from raw session state if present
-    # We can't reliably read tab1 widget value here, so we provide a lab paste box also here:
-    lab_text2 = st.text_area(
-        "Opsional: paste hasil lab di sini juga (biar auto jadi item penunjang)",
-        height=120,
-        placeholder="Paste lab (kalau belum paste di tab 1) ..."
-    )
-    lab_items = lab_block_to_items(lab_text2) if lab_text2.strip() else []
+    cached_lab = clean(st.session_state.get("lab_text_cache", ""))
+    lab_items = lab_block_to_items(cached_lab) if cached_lab else []
+
     merged_pen = dedupe_case_insensitive(base_pen + lab_items)
 
     penunjang_editor = st.text_area(
-        "1 baris = 1 item penunjang (contoh: OPG X-Ray (tanggal), Thorax X-Ray (tanggal), CT/BT, dll)",
+        "1 baris = 1 item penunjang (boleh CT-Scan/OPG/Thorax/Lab/EKG/HIV, dll)",
         value="\n".join(merged_pen),
-        height=160
+        height=200,
+        placeholder="Contoh:\nCT-Scan (tanggal)\nKesan: ...\nThorax X-Ray (tanggal)\nOPG X-Ray (tanggal)\nLab darah (tanggal)\nWBC : ...\nKesan : ...\nEKG (tanggal)\nKesan: ...",
     )
     penunjang_items = dedupe_case_insensitive([x for x in penunjang_editor.splitlines() if x.strip()])
 
@@ -487,8 +588,37 @@ with tab2:
         placeholder="Contoh:\nIVFD RL 20 tpm (makrodrips)\nPuasa mulai 01.30 WITA\nAntibiotik profilaksis Ceftriaxone inj 1 gr jam 06.30 WITA\nSiap darah 1 bag PRC"
     )
 
-    # Final plan lines: picked + custom lines
     plan_lines = picked + [x.strip() for x in custom_plan.splitlines() if x.strip()]
+
+    # Auto-insert common required/structured lines
+    if include_ivfd and ivfd_line:
+        plan_lines.append(ivfd_line)
+
+    if include_puasa and clean(puasa_mulai):
+        plan_lines.append(
+            f"Puasa 6 jam pre op atau sesuai instruksi dari TS. Anestesi yaitu mulai Pukul {puasa_mulai} {zona_waktu}"
+        )
+
+    if include_ab:
+        ab_display = " ".join([x for x in [clean(ab_nama), clean(ab_dosis)] if x])
+        if not ab_display:
+            ab_display = "(isi antibiotik)"
+        skin_phrase = " (skin test terlebih dahulu)" if ab_skin_test else ""
+        if clean(ab_jam):
+            plan_lines.append(
+                f"Pasien rencana diberikan antibiotik profilaksis {ab_display}, 1 jam sebelum operasi{skin_phrase} pada Pukul {ab_jam} {zona_waktu}"
+            )
+
+    # Deduplicate plan lines while preserving order
+    plan_lines = dedupe_case_insensitive(plan_lines)
+
+    st.subheader("Medikasi (opsional)")
+    meds_text = st.text_area(
+        "1 baris = 1 obat",
+        height=120,
+        placeholder="Contoh:\nAmpicillin Sulbactam inj 1500 mg/8 jam/IV\nMetronidazole inj 500 mg/8 jam/IV"
+    )
+    meds_items = [x.strip() for x in meds_text.splitlines() if x.strip()]
 
     st.divider()
 
@@ -518,6 +648,8 @@ with tab2:
         "plan_lines": plan_lines,
         "residen": residen_out,
         "dpjp": dpjp_final,
+        "bb": bb,
+        "meds_items": meds_items,
     }
 
     st.success("✅ Sudah siap. Lanjut ke tab 3) Output.")
@@ -568,6 +700,7 @@ with tab3:
             kamar=edited["kamar"] or "(isi kamar/bed)",
             penunjang_items=edited["penunjang_items"],
             plan_items=edited["plan_lines"],
+            meds_items=edited.get("meds_items"),
             residen=edited["residen"] or "-",
             dpjp=edited["dpjp"] or "-",
         )
